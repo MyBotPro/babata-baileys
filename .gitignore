@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.tgz
+.env
+**/session/
+**/creds.json
+**/db/
