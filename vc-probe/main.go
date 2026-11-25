@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/polymorfa/hypermeow/store/sqlstore"
 	"github.com/polymorfa/hypermeow/types"
 	mc "github.com/purpshell/meowcaller"
+	"github.com/rs/zerolog"
 	"github.com/skip2/go-qrcode"
 	_ "modernc.org/sqlite"
 )
@@ -77,7 +80,8 @@ func run(ctx context.Context) error {
 		return err
 	}
 	client := wa.NewClient(device, nil)
-	engine := mc.NewClient(client)
+	engine := mc.NewClient(client, mc.WithLogger(zerolog.New(safeEngineLog{}).Level(zerolog.DebugLevel)))
+	log.Println("[VC TEST] DIAGNOSTIC V2 (no raw packet dump)")
 	defer client.Disconnect()
 	if client.Store.ID == nil {
 		qr, err := client.GetQRChannel(ctx)
@@ -166,7 +170,7 @@ paired:
 	case <-ctx.Done():
 		return ctx.Err()
 	case reason := <-ended:
-		return fmt.Errorf("call ended: %s", reason)
+		return fmt.Errorf("call ended before media ready (reason category: %s)", classifyError(reason))
 	case <-mediaTimer.C:
 		return errors.New("media timeout")
 	case <-ready:
@@ -191,7 +195,7 @@ paired:
 			return ctx.Err()
 		case reason := <-ended:
 			t.Stop()
-			return fmt.Errorf("ended during stream: %s", reason)
+			return fmt.Errorf("ended during stream (reason category: %s)", classifyError(reason))
 		case <-t.C:
 		}
 		if err := call.SendVideoWithDuration(frame, interval); err != nil {
@@ -276,4 +280,56 @@ func splitAUD(raw []byte) [][]byte {
 		out = append(out, raw[a:b])
 	}
 	return out
+}
+
+// Only emit diagnostic event descriptions and classified errors, never raw fields,
+// credentials, phone numbers, packet dumps, addresses or remote media.
+type safeEngineLog struct{}
+
+var safeMessage = regexp.MustCompile(`^[A-Za-z][A-Za-z _/().-]{0,119}$`)
+
+func (safeEngineLog) Write(p []byte) (int, error) {
+	var event struct {
+		Level   string `json:"level"`
+		Message string `json:"message"`
+		Error   string `json:"error"`
+	}
+	if json.Unmarshal(p, &event) != nil {
+		return len(p), nil
+	}
+	if !safeMessage.MatchString(event.Message) {
+		event.Message = "structured event (details withheld)"
+	}
+	switch event.Level {
+	case "trace", "debug", "info", "warn", "error", "fatal", "panic":
+	default:
+		event.Level = "unknown"
+	}
+	log.Printf("[VC ENGINE] %s %s | error=%s", event.Level, event.Message, classifyError(event.Error))
+	return len(p), nil
+}
+func classifyError(s string) string {
+	s = strings.ToLower(s)
+	switch {
+	case s == "":
+		return "none"
+	case strings.Contains(s, "timeout") || strings.Contains(s, "deadline"):
+		return "timeout"
+	case strings.Contains(s, "refused"):
+		return "connection-refused"
+	case strings.Contains(s, "unreachable"):
+		return "network-unreachable"
+	case strings.Contains(s, "permission") || strings.Contains(s, "not permitted"):
+		return "permission"
+	case strings.Contains(s, "authentication") || strings.Contains(s, "decrypt"):
+		return "authentication"
+	case strings.Contains(s, "dtls"):
+		return "dtls"
+	case strings.Contains(s, "relay"):
+		return "relay"
+	case strings.Contains(s, "closed") || strings.Contains(s, "cancel"):
+		return "closed-or-cancelled"
+	default:
+		return "other (details withheld)"
+	}
 }
