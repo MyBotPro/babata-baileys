@@ -1,6 +1,18 @@
+
+    
+  
 name: Build Babata VC Probe
 on:
   workflow_dispatch:
+    inputs:
+      relay_mode:
+        description: 'Relay port experiment (web: 3478 to 3480; advertised: unchanged)'
+        required: true
+        default: web
+        type: choice
+        options:
+          - web
+          - advertised
 permissions:
   contents: read
 jobs:
@@ -19,6 +31,59 @@ jobs:
         run: |
           go get github.com/purpshell/meowcaller@c48c3e2a243c672c942cbf0c941d14161720d540 github.com/skip2/go-qrcode@v0.0.0-20200617195104-da1b6568686e modernc.org/sqlite@v1.53.0
           go mod tidy
+      - name: Patch relay transport for controlled test
+        env:
+          RELAY_MODE: ${{ inputs.relay_mode }}
+        run: |
+          set -eu
+          module_dir=$(go list -m -f '{{.Dir}}' github.com/purpshell/meowcaller)
+          test -f "$module_dir/relay/relay.go"
+          cp -a "$module_dir" .meowcaller-patched
+          chmod -R u+w .meowcaller-patched
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          path = Path('.meowcaller-patched/relay/relay.go')
+          text = path.read_text()
+          def replace_once(old, new):
+              global text
+              if text.count(old) != 1:
+                  raise SystemExit('Unexpected upstream source; refusing to patch')
+              text = text.replace(old, new, 1)
+          replace_once('import (\n', 'import (\n\t"context"\n\t"time"\n')
+          mode = os.environ['RELAY_MODE']
+          if mode not in ('web', 'advertised'):
+              raise SystemExit('Invalid relay mode')
+          original = '\tlg := cfg.log'
+          insertion = original + '\n\tlg.Info().Msg("Babata relay transport revision three")'
+          if mode == 'web':
+              insertion += '''
+          	if relayAddr.Port == 3478 {
+          		addr := *relayAddr
+          		addr.Port = 3480
+          		relayAddr = &addr
+          		lg.Info().Msg("using experimental web relay port")
+          	} else {
+          		lg.Info().Msg("retaining advertised relay port")
+          	}'''
+          else:
+              insertion += '\n\tlg.Info().Msg("retaining advertised relay port")'
+          replace_once(original, insertion)
+          replace_once('\tlg.Debug().Msg("relay dtls handshake complete")', '''
+          	lg.Info().Msg("relay dtls handshake starting")
+          	hctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+          	err = dtlsConn.HandshakeContext(hctx)
+          	cancel()
+          	if err != nil {
+          		lg.Warn().Err(err).Msg("relay dtls handshake failed")
+          		return fail(fmt.Errorf("dtls explicit handshake: %w", err))
+          	}
+          	lg.Info().Msg("relay dtls handshake complete")'''.lstrip('\n'))
+          path.write_text(text)
+          PY
+          gofmt -w .meowcaller-patched/relay/relay.go
+          go mod edit -replace=github.com/purpshell/meowcaller=./.meowcaller-patched
+          go mod tidy
       - name: Build Linux binary
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o babata-vc-probe .
@@ -29,3 +94,4 @@ jobs:
         with:
           name: babata-vc-probe-linux-amd64
           path: vc-probe/babata-vc-probe-linux-amd64.tar.gz
+
