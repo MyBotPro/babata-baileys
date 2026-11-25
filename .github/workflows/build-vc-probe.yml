@@ -1,0 +1,31 @@
+name: Build Babata VC Probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vc-probe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: false
+      - name: Fetch pinned dependencies
+        run: |
+          go get github.com/purpshell/meowcaller@c48c3e2a243c672c942cbf0c941d14161720d540 github.com/skip2/go-qrcode@v0.0.0-20200617195104-da1b6568686e modernc.org/sqlite@v1.53.0
+          go mod tidy
+      - name: Build Linux binary
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o babata-vc-probe .
+          ./babata-vc-probe --help
+          go list -m all > dependencies.txt
+          tar czf babata-vc-probe-linux-amd64.tar.gz babata-vc-probe dependencies.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: babata-vc-probe-linux-amd64
+          path: vc-probe/babata-vc-probe-linux-amd64.tar.gz
